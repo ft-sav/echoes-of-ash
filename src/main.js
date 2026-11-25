@@ -8,15 +8,17 @@ import { createGameUI } from './ui.js';
 import {
   buildWorld,
   createAsciiRockTexture,
-  getGroundY,
   getWalkableY,
   isInWater,
+  getBiomeWeights,
   getAreaInfo,
   BRIDGE_X,
   BRIDGE_Z,
   WATERFALL_POOL,
   SHRINE_POS,
   KEEP_POS,
+  DESERT_TEMPLE_POS,
+  SNOW_MONUMENT_POS,
 } from './world.js';
 
 // =========================================================
@@ -38,10 +40,7 @@ function createAsciiPass(width, height, cellW = 5.5, cellH = 9.0) {
   ctx.font = 'bold 36px "Consolas", "Courier New", monospace';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-
-  for (let i = 0; i < CHARS.length; i++) {
-    ctx.fillText(CHARS[i], i * cw + cw / 2, ch / 2 + 1);
-  }
+  for (let i = 0; i < CHARS.length; i++) ctx.fillText(CHARS[i], i * cw + cw / 2, ch / 2 + 1);
 
   const atlas = new THREE.CanvasTexture(canvas);
   atlas.minFilter = THREE.LinearFilter;
@@ -176,7 +175,6 @@ moonLight.shadow.bias = -0.0005;
 scene.add(moonLight);
 scene.add(moonLight.target);
 
-// Pre-allocated 2-light Orb Pool (Zero shader recompilations during combat)
 const orbLightPool = Array.from({ length: 2 }, () => {
   const pl = new THREE.PointLight(0xff5511, 0, 10, 1.2);
   pl.position.set(0, -50, 0);
@@ -184,12 +182,168 @@ const orbLightPool = Array.from({ length: 2 }, () => {
   return pl;
 });
 
-// Build Expanded Multi-Biome World, Stream, Bridge & Ashenbrook Village
 const world = buildWorld(scene);
 const ui = createGameUI(world.drawStaticMinimap);
 
 // =========================================================
-// 3. RIDEABLE WARHORSE + VERLET FLOWING MANE & TAIL
+// 3. POOLED VFX SYSTEM (SPARKS, CHUNKS, SOULS, RINGS, HEAL PILLAR, AFTERIMAGES)
+// =========================================================
+const dummy = new THREE.Object3D();
+const tmpCol = new THREE.Color(0xffffff);
+
+// 1-Draw-Call Instanced Particle & Chunk Pool (200 slots: sparks, ash rise, chunks, biome dust)
+const MAX_PARTS = 200;
+const partMesh = new THREE.InstancedMesh(
+  new THREE.BoxGeometry(0.18, 0.18, 0.18),
+  new THREE.MeshBasicMaterial({ color: 0xffffff }),
+  MAX_PARTS
+);
+partMesh.frustumCulled = false;
+for (let i = 0; i < MAX_PARTS; i++) {
+  dummy.scale.setScalar(0);
+  dummy.updateMatrix();
+  partMesh.setMatrixAt(i, dummy.matrix);
+  partMesh.setColorAt(i, tmpCol);
+}
+partMesh.instanceMatrix.needsUpdate = true;
+partMesh.instanceColor.needsUpdate = true;
+scene.add(partMesh);
+
+const partData = Array.from({ length: MAX_PARTS }, () => ({
+  active: false,
+  pos: new THREE.Vector3(),
+  vel: new THREE.Vector3(),
+  rot: new THREE.Vector3(),
+  life: 0,
+  maxLife: 0.5,
+  gravity: 15,
+  bounce: false,
+  scale: 1,
+}));
+let partCursor = 0;
+
+function spawnParticles(pos, hex, count = 12, opts = {}) {
+  const { spread = 8, upMin = 1.5, upRand = 4.5, gravity = 15, life = 0.48, bounce = false, scale = 1.0 } = opts;
+  tmpCol.setHex(hex);
+  for (let i = 0; i < count; i++) {
+    const idx = partCursor;
+    partCursor = (partCursor + 1) % MAX_PARTS;
+    const p = partData[idx];
+    p.active = true;
+    p.pos.set(pos.x + (Math.random() - 0.5) * 0.4, Math.max(pos.y, 0.25) + Math.random() * 0.5, pos.z + (Math.random() - 0.5) * 0.4);
+    p.vel.set((Math.random() - 0.5) * spread, upMin + Math.random() * upRand, (Math.random() - 0.5) * spread);
+    p.rot.set(Math.random() * 6, Math.random() * 6, Math.random() * 6);
+    p.maxLife = life * (0.75 + Math.random() * 0.45);
+    p.life = p.maxLife;
+    p.gravity = gravity;
+    p.bounce = bounce;
+    p.scale = scale;
+    partMesh.setColorAt(idx, tmpCol);
+  }
+  partMesh.instanceColor.needsUpdate = true;
+}
+
+// Curated Effect: Enemy Defeat — Ash Dissolve + Chunk Burst + Soul Rise
+const soulPool = Array.from({ length: 5 }, () => {
+  const g = new THREE.Group();
+  const core = new THREE.Mesh(
+    new THREE.SphereGeometry(0.28, 8, 8),
+    new THREE.MeshBasicMaterial({ color: 0xc8f5ff, transparent: true, opacity: 0.85 })
+  );
+  const tail = new THREE.Mesh(
+    new THREE.ConeGeometry(0.24, 0.75, 6),
+    new THREE.MeshBasicMaterial({ color: 0x88d8ff, transparent: true, opacity: 0.55 })
+  );
+  tail.rotation.x = Math.PI;
+  tail.position.y = -0.45;
+  g.add(core, tail);
+  g.visible = false;
+  scene.add(g);
+  return { g, core, tail, active: false, life: 0, maxLife: 1.4, baseX: 0, baseZ: 0, phase: 0 };
+});
+
+function spawnSoulRise(pos) {
+  const s = soulPool.find((x) => !x.active) || soulPool[0];
+  s.active = true;
+  s.life = 1.35;
+  s.maxLife = 1.35;
+  s.baseX = pos.x;
+  s.baseZ = pos.z;
+  s.phase = Math.random() * 6;
+  s.g.position.set(pos.x, pos.y + 1.0, pos.z);
+  s.g.visible = true;
+}
+
+// Curated Effect: Expanding Ground Rings (Heal Circle, Summon Circle, Fire Ring Impact)
+const vfxRingPool = Array.from({ length: 8 }, () => {
+  const m = new THREE.Mesh(
+    new THREE.RingGeometry(0.75, 1.0, 28),
+    new THREE.MeshBasicMaterial({ color: 0x66ffdd, side: THREE.DoubleSide, transparent: true, opacity: 0 })
+  );
+  m.rotation.x = -Math.PI / 2;
+  m.visible = false;
+  scene.add(m);
+  return { m, active: false, life: 0, maxLife: 0.45, maxScale: 3.5 };
+});
+
+function spawnExpandingRing(pos, hex, maxScale = 3.2, duration = 0.45) {
+  const r = vfxRingPool.find((x) => !x.active) || vfxRingPool[0];
+  r.active = true;
+  r.life = duration;
+  r.maxLife = duration;
+  r.maxScale = maxScale;
+  r.m.material.color.setHex(hex);
+  r.m.position.set(pos.x, pos.y + 0.16, pos.z);
+  r.m.scale.setScalar(0.35);
+  r.m.visible = true;
+}
+
+// Curated Effect: Healing Light Pillar (25% instant heal on kill)
+const healPillar = new THREE.Mesh(
+  new THREE.CylinderGeometry(0.95, 1.1, 13, 12, 1, true),
+  new THREE.MeshBasicMaterial({ color: 0x77ffdd, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false })
+);
+healPillar.visible = false;
+scene.add(healPillar);
+let healPillarTimer = 0;
+
+// Curated Effect: Dash Afterimages (5 Pooled Mint Silhouettes)
+const afterimagePool = Array.from({ length: 5 }, () => {
+  const g = new THREE.Group();
+  const mat = new THREE.MeshBasicMaterial({ color: 0x66ffdd, transparent: true, opacity: 0, depthWrite: false });
+  const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.38, 0.32, 0.95, 6), mat);
+  torso.position.y = 1.15;
+  const head = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.26, 0.48, 6), mat);
+  head.position.y = 1.88;
+  g.add(torso, head);
+  g.visible = false;
+  scene.add(g);
+  return { g, mat, active: false, life: 0, maxLife: 0.28 };
+});
+let afterimageCursor = 0;
+
+function spawnAfterimage(pos, yaw) {
+  const a = afterimagePool[afterimageCursor];
+  afterimageCursor = (afterimageCursor + 1) % afterimagePool.length;
+  a.active = true;
+  a.life = 0.28;
+  a.maxLife = 0.28;
+  a.g.position.copy(pos);
+  a.g.rotation.y = yaw;
+  a.mat.opacity = 0.52;
+  a.g.visible = true;
+}
+
+function getBiomeDustColor(x, z) {
+  const b = getBiomeWeights(x, z);
+  if (b.ice + b.frost > 0.45) return 0xd8eefc;
+  if (b.desert + b.steppe > 0.45) return 0xc79e65;
+  if (b.swamp > 0.45) return 0x3b4d38;
+  return 0x4b5e46;
+}
+
+// =========================================================
+// 4. RIDEABLE WARHORSE + VERLET FLOWING MANE & TAIL
 // =========================================================
 function createWarhorse(x, z) {
   const root = new THREE.Group();
@@ -331,7 +485,6 @@ function updateHorseHair(horse, dt, t, windX, windZ) {
       const vy = (n.pos.y - n.prev.y) * 0.84;
       const vz = (n.pos.z - n.prev.z) * 0.84;
       n.prev.copy(n.pos);
-
       const flutter = Math.sin(t * (7 + gallopKick * 10) + st.phase + k * 0.7);
       n.pos.x += vx + (windX * 4.5 + flutter * (2.2 + gallopKick * 4.5)) * dt * dt;
       n.pos.y += vy + (-7.5 + gallopKick * 2.2) * dt * dt;
@@ -360,25 +513,20 @@ function updateHorseHair(horse, dt, t, windX, windZ) {
       const w0 = st.width * (1.0 - k / st.nodes.length);
       const w1 = st.width * (1.0 - (k + 1) / st.nodes.length);
 
-      const ax1 = a.x - _side.x * w0, ay1 = a.y, az1 = a.z - _side.z * w0;
-      const ax2 = a.x + _side.x * w0, ay2 = a.y, az2 = a.z + _side.z * w0;
-      const bx1 = b.x - _side.x * w1, by1 = b.y, bz1 = b.z - _side.z * w1;
-      const bx2 = b.x + _side.x * w1, by2 = b.y, bz2 = b.z + _side.z * w1;
+      posArr[ptr++] = a.x - _side.x * w0; posArr[ptr++] = a.y; posArr[ptr++] = a.z - _side.z * w0;
+      posArr[ptr++] = a.x + _side.x * w0; posArr[ptr++] = a.y; posArr[ptr++] = a.z + _side.z * w0;
+      posArr[ptr++] = b.x + _side.x * w1; posArr[ptr++] = b.y; posArr[ptr++] = b.z + _side.z * w1;
 
-      posArr[ptr++] = ax1; posArr[ptr++] = ay1; posArr[ptr++] = az1;
-      posArr[ptr++] = ax2; posArr[ptr++] = ay2; posArr[ptr++] = az2;
-      posArr[ptr++] = bx2; posArr[ptr++] = by2; posArr[ptr++] = bz2;
-
-      posArr[ptr++] = ax1; posArr[ptr++] = ay1; posArr[ptr++] = az1;
-      posArr[ptr++] = bx2; posArr[ptr++] = by2; posArr[ptr++] = bz2;
-      posArr[ptr++] = bx1; posArr[ptr++] = by1; posArr[ptr++] = bz1;
+      posArr[ptr++] = a.x - _side.x * w0; posArr[ptr++] = a.y; posArr[ptr++] = a.z - _side.z * w0;
+      posArr[ptr++] = b.x + _side.x * w1; posArr[ptr++] = b.y; posArr[ptr++] = b.z + _side.z * w1;
+      posArr[ptr++] = b.x - _side.x * w1; posArr[ptr++] = b.y; posArr[ptr++] = b.z - _side.z * w1;
     }
   }
   horse.hairGeo.attributes.position.needsUpdate = true;
 }
 
 // =========================================================
-// 4. REALISTIC KNIGHT + VERLET CLOTH CAPE
+// 5. KNIGHT WITH DETAILED BROADSWORD, SLASH ARC & VERLET CAPE
 // =========================================================
 function createKnight() {
   const group = new THREE.Group();
@@ -432,16 +580,50 @@ function createKnight() {
   const pauldronR = pauldronL.clone();
   pauldronR.position.x = 0.52;
 
-  const armR = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.65, 0.22), darkSteel);
-  armR.position.set(0.52, 1.15, 0.06);
-  const gauntletR = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.26, 0.24), steelMat);
-  gauntletR.position.set(0.52, 0.84, 0.1);
+  // --- ARTICULATED RIGHT SWORD ARM + DETAILED BROADSWORD ---
+  const swordPivot = new THREE.Group();
+  swordPivot.position.set(0.52, 1.38, 0.08);
+  const armR = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.58, 0.22), darkSteel);
+  armR.position.y = -0.25;
+  const gauntletR = new THREE.Mesh(new THREE.BoxGeometry(0.23, 0.26, 0.25), steelMat);
+  gauntletR.position.set(0, -0.52, 0.06);
 
-  const scabbard = new THREE.Mesh(new THREE.BoxGeometry(0.1, 1.15, 0.12), leatherMat);
-  scabbard.position.set(0.46, 0.82, -0.18);
-  scabbard.rotation.x = 0.45;
-  const hilt = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.06, 0.08), brassMat);
-  hilt.position.set(0.46, 1.28, 0.06);
+  // Detailed Broadsword (Pommel + Leather Grip + Brass Crossguard + Fuller Blade + Tip + Rune Edge)
+  const sword = new THREE.Group();
+  sword.position.set(0, -0.52, 0.16);
+  sword.rotation.x = Math.PI * 0.44;
+  const pommel = new THREE.Mesh(new THREE.OctahedronGeometry(0.09, 0), brassMat);
+  pommel.position.y = -0.26;
+  const grip = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.05, 0.34, 6), leatherMat);
+  grip.position.y = -0.06;
+  const guard = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.08, 0.11), brassMat);
+  guard.position.y = 0.12;
+  const bladeCore = new THREE.Mesh(
+    new THREE.BoxGeometry(0.14, 1.48, 0.045),
+    new THREE.MeshStandardMaterial({ color: 0xdfe9f5, metalness: 0.85, roughness: 0.18 })
+  );
+  bladeCore.position.y = 0.9;
+  const fuller = new THREE.Mesh(new THREE.BoxGeometry(0.045, 1.25, 0.055), darkSteel);
+  fuller.position.y = 0.86;
+  const runeEdge = new THREE.Mesh(
+    new THREE.BoxGeometry(0.16, 1.42, 0.02),
+    new THREE.MeshBasicMaterial({ color: 0x88eeff, transparent: true, opacity: 0.45 })
+  );
+  runeEdge.position.y = 0.9;
+  const bladeTip = new THREE.Mesh(new THREE.ConeGeometry(0.08, 0.32, 4), steelMat);
+  bladeTip.position.y = 1.8;
+  bladeTip.rotation.y = Math.PI / 4;
+  sword.add(pommel, grip, guard, bladeCore, fuller, runeEdge, bladeTip);
+  swordPivot.add(armR, gauntletR, sword);
+
+  // Curved Glowing Slash Arc Mesh (sweeps visibly on sword swing!)
+  const slashArc = new THREE.Mesh(
+    new THREE.RingGeometry(1.15, 2.65, 18, 1, -Math.PI * 0.42, Math.PI * 0.84),
+    new THREE.MeshBasicMaterial({ color: 0xaaf5ff, side: THREE.DoubleSide, transparent: true, opacity: 0, depthWrite: false })
+  );
+  slashArc.rotation.x = -Math.PI / 2;
+  slashArc.position.set(0, 1.15, 0.35);
+  group.add(slashArc);
 
   const helm = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.28, 0.52, 8), steelMat);
   helm.position.y = 1.9;
@@ -454,6 +636,7 @@ function createKnight() {
   const plume = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.26, 0.48), crestMat);
   plume.position.set(0, 2.25, -0.06);
 
+  // Detailed Heater Resonance Shield
   const shieldGroup = new THREE.Group();
   shieldGroup.position.set(-0.62, 1.12, 0.26);
   shieldGroup.rotation.y = -0.22;
@@ -478,8 +661,7 @@ function createKnight() {
 
   bodyPivot.add(
     waist, belt, buckle, chest, chestTrim, gorget,
-    pauldronL, pauldronR, armR, gauntletR, scabbard, hilt,
-    helm, helmRim, visor, plume, shieldGroup
+    pauldronL, pauldronR, swordPivot, helm, helmRim, visor, plume, shieldGroup
   );
   group.add(shieldRing, playerLight, shieldGlow);
 
@@ -516,9 +698,10 @@ function createKnight() {
   scene.add(capeMesh);
 
   return {
-    group, bodyPivot, leftLeg, rightLeg, shieldGroup, shieldRing, shieldGlow,
+    group, bodyPivot, leftLeg, rightLeg, swordPivot, slashArc, shieldGroup, shieldRing, shieldGlow,
+    armorMats: [steelMat, darkSteel, brassMat],
     capeCols: cols, capeRows: rows, capeAnchors, capeNodes, capeGeo, capePositions,
-    yaw: 0, speed: 0, bank: 0,
+    yaw: 0, speed: 0, bank: 0, knockVel: new THREE.Vector3(),
   };
 }
 
@@ -610,37 +793,97 @@ function updateKnightCape(knight, dt, t, windX, windZ, moveSpeed) {
 }
 
 // =========================================================
-// 5. MOBS, WARDEN BOSS & ZERO-ALLOCATION COMBAT POOLS
+// 6. BIOME-SPECIFIC MOBS (MELEE & RANGED) + HYBRID BOSS
 // =========================================================
-const boneMat = new THREE.MeshStandardMaterial({ color: 0xe3dfd3, roughness: 0.7 });
-const cloakMat = new THREE.MeshStandardMaterial({ color: 0x1f2e24, roughness: 0.9 });
-const staffMat = new THREE.MeshStandardMaterial({ color: 0x4d3524 });
-const greenGlowMat = new THREE.MeshBasicMaterial({ color: 0x55ff44 });
+const MOB_PRESETS = {
+  swordsman: { name: 'Ashbone Swordsman', combat: 'melee', hp: 55, speed: 3.8, dmg: 16, bodyHex: 0x3b424c, headHex: 0xe3dfd3, accentHex: 0xff6644, scale: 1.0, heavy: false },
+  acolyte:   { name: 'Hex Acolyte',       combat: 'ranged', hp: 45, speed: 2.3, dmg: 16, bodyHex: 0x1f3026, headHex: 0xe3dfd3, accentHex: 0x55ff55, scale: 1.0, heavy: false },
+  stalker:   { name: 'Mire Stalker',      combat: 'melee', hp: 50, speed: 4.9, dmg: 14, bodyHex: 0x203326, headHex: 0x354d38, accentHex: 0x44ffaa, scale: 0.92, heavy: false },
+  necro:     { name: 'Shrine Necromancer',combat: 'ranged', hp: 55, speed: 2.4, dmg: 18, bodyHex: 0x261d36, headHex: 0xd8dce8, accentHex: 0x9966ff, scale: 1.05, heavy: false },
+  tombguard: { name: 'Dune Tomb Guard',   combat: 'melee', hp: 80, speed: 3.4, dmg: 20, bodyHex: 0x8f6b40, headHex: 0xc9a870, accentHex: 0xffaa33, scale: 1.18, heavy: true },
+  pyro:      { name: 'Sun Pyromancer',    combat: 'ranged', hp: 55, speed: 2.5, dmg: 18, bodyHex: 0x5e2d1c, headHex: 0xd9ba8c, accentHex: 0xff7722, scale: 1.02, heavy: false },
+  raider:    { name: 'Frostbound Raider', combat: 'melee', hp: 75, speed: 3.7, dmg: 20, bodyHex: 0x3e5466, headHex: 0xcfe8f7, accentHex: 0x77ddff, scale: 1.15, heavy: true },
+  wraith:    { name: 'Glacier Wraith',    combat: 'ranged', hp: 55, speed: 2.8, dmg: 16, bodyHex: 0x4b708a, headHex: 0xe0f6ff, accentHex: 0x66e0ff, scale: 1.05, heavy: false },
+  brute:     { name: 'Thornback Brute',   combat: 'melee', hp: 85, speed: 3.2, dmg: 22, bodyHex: 0x234729, headHex: 0x405c38, accentHex: 0xb5ff55, scale: 1.24, heavy: true },
+};
 
-function createSkeleton(x, z, role) {
+function createBiomeMob(x, z, typeKey, role) {
+  const cfg = MOB_PRESETS[typeKey];
   const group = new THREE.Group();
-  const leftLeg = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.75, 6), boneMat);
-  leftLeg.position.set(-0.18, 0.37, 0);
+  const bodyMat = new THREE.MeshStandardMaterial({ color: cfg.bodyHex, roughness: 0.8 });
+  const headMat = new THREE.MeshStandardMaterial({ color: cfg.headHex, roughness: 0.65 });
+  const accentMat = new THREE.MeshBasicMaterial({ color: cfg.accentHex });
+  const weapMat = new THREE.MeshStandardMaterial({ color: 0xaab6c2, metalness: 0.7, roughness: 0.35 });
+
+  const leftLeg = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 0.75, 6), bodyMat);
+  leftLeg.position.set(-0.19, 0.37, 0);
   const rightLeg = leftLeg.clone();
-  rightLeg.position.x = 0.18;
-  const ribs = new THREE.Mesh(new THREE.BoxGeometry(0.58, 0.8, 0.36), cloakMat);
-  ribs.position.y = 1.1;
-  ribs.castShadow = true;
-  const skull = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.48, 0.46), boneMat);
-  skull.position.y = 1.74;
-  const eyeL = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.1, 0.06), greenGlowMat);
-  eyeL.position.set(-0.11, 1.76, 0.23);
+  rightLeg.position.x = 0.19;
+
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.84, 0.38), bodyMat);
+  torso.position.y = 1.12;
+  torso.castShadow = true;
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.48, 0.46), headMat);
+  head.position.y = 1.78;
+  const eyeL = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.1, 0.06), accentMat);
+  eyeL.position.set(-0.11, 1.8, 0.24);
   const eyeR = eyeL.clone();
   eyeR.position.x = 0.11;
-  const staff = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 2.0, 6), staffMat);
-  staff.position.set(0.5, 1.2, 0.25);
-  const staffOrb = new THREE.Mesh(new THREE.OctahedronGeometry(0.22), greenGlowMat);
-  staffOrb.position.set(0.5, 2.25, 0.25);
 
-  group.add(leftLeg, rightLeg, ribs, skull, eyeL, eyeR, staff, staffOrb);
+  // Articulated weapon arm (swings on melee wind-up or lifts on ranged cast)
+  const weaponArm = new THREE.Group();
+  weaponArm.position.set(0.48, 1.32, 0.12);
+  if (cfg.combat === 'melee') {
+    const blade = new THREE.Mesh(
+      typeKey === 'brute' ? new THREE.CylinderGeometry(0.16, 0.09, 1.45, 6) : new THREE.BoxGeometry(0.12, 1.35, 0.08),
+      typeKey === 'brute' ? bodyMat : weapMat
+    );
+    blade.position.set(0, -0.2, 0.45);
+    blade.rotation.x = Math.PI * 0.45;
+    const edgeGlow = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.9, 0.05), accentMat);
+    edgeGlow.position.set(0, -0.2, 0.6);
+    edgeGlow.rotation.x = Math.PI * 0.45;
+    weaponArm.add(blade, edgeGlow);
+  } else {
+    const staff = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 2.0, 6), new THREE.MeshStandardMaterial({ color: 0x4d3524 }));
+    staff.position.set(0, -0.1, 0.16);
+    const orb = new THREE.Mesh(new THREE.OctahedronGeometry(0.24), accentMat);
+    orb.position.set(0, 0.95, 0.16);
+    weaponArm.add(staff, orb);
+  }
+
+  group.add(leftLeg, rightLeg, torso, head, eyeL, eyeR, weaponArm);
+  group.scale.setScalar(cfg.scale);
   group.position.set(x, getWalkableY(x, z), z);
   scene.add(group);
-  return { group, leftLeg, rightLeg, hp: 2, maxHp: 2, homeX: x, homeZ: z, role, fireTimer: 1.4 + Math.random() };
+
+  return {
+    group,
+    leftLeg,
+    rightLeg,
+    weaponArm,
+    flashMats: [bodyMat, headMat],
+    name: cfg.name,
+    combat: cfg.combat,
+    accentHex: cfg.accentHex,
+    heavy: cfg.heavy,
+    hp: cfg.hp,
+    maxHp: cfg.hp,
+    speed: cfg.speed,
+    dmg: cfg.dmg,
+    homeX: x,
+    homeZ: z,
+    role,
+    // Spawn animation & Combat state
+    spawned: false,
+    spawnTimer: 0,
+    hitFlash: 0,
+    stagger: 0,
+    knockVel: new THREE.Vector3(),
+    atkTimer: 1.2 + Math.random(),
+    windup: 0,
+    isBoss: false,
+  };
 }
 
 function createWarden(x, z) {
@@ -669,6 +912,17 @@ function createWarden(x, z) {
   const eyeR = eyeL.clone();
   eyeR.position.x = 0.19;
 
+  // Warden's Ember Greatsword for Close-Range Cleaves
+  const weaponArm = new THREE.Group();
+  weaponArm.position.set(1.4, 2.3, 0.2);
+  const gsBlade = new THREE.Mesh(new THREE.BoxGeometry(0.24, 2.8, 0.1), ironMat);
+  gsBlade.position.set(0, -0.3, 0.9);
+  gsBlade.rotation.x = Math.PI * 0.45;
+  const gsGlow = new THREE.Mesh(new THREE.BoxGeometry(0.28, 2.5, 0.05), emberMat);
+  gsGlow.position.set(0, -0.3, 0.95);
+  gsGlow.rotation.x = Math.PI * 0.45;
+  weaponArm.add(gsBlade, gsGlow);
+
   const halo = new THREE.Mesh(
     new THREE.TorusGeometry(1.75, 0.09, 8, 28),
     new THREE.MeshBasicMaterial({ color: 0xff8822 })
@@ -676,10 +930,35 @@ function createWarden(x, z) {
   halo.rotation.x = Math.PI / 2;
   halo.position.y = 4.15;
 
-  group.add(body, shoulders, head, hornL, hornR, eyeL, eyeR, halo);
+  group.add(body, shoulders, head, hornL, hornR, eyeL, eyeR, weaponArm, halo);
   group.position.set(x, 0, z);
   scene.add(group);
-  return { group, halo, hp: 6, maxHp: 6, fireTimer: 1.6, ringTimer: 4.5 };
+
+  return {
+    group,
+    halo,
+    weaponArm,
+    flashMats: [ironMat],
+    name: 'The Horned Warden',
+    combat: 'hybrid',
+    accentHex: 0xff5522,
+    heavy: true,
+    hp: 180,
+    maxHp: 180,
+    speed: 3.1,
+    dmg: 22,
+    homeX: x,
+    homeZ: z,
+    spawned: false,
+    spawnTimer: 0,
+    hitFlash: 0,
+    stagger: 0,
+    knockVel: new THREE.Vector3(),
+    fireTimer: 1.8,
+    ringTimer: 4.5,
+    windup: 0,
+    isBoss: true,
+  };
 }
 
 const knight = createKnight();
@@ -689,26 +968,35 @@ scene.add(knight.group);
 const horse = createWarhorse(-5.0, 10.5);
 scene.add(horse.root);
 
-const skeletons = [
-  createSkeleton(BRIDGE_X + 9.2, BRIDGE_Z + 1.2, 'act1'),
-  createSkeleton(BRIDGE_X + 9.6, BRIDGE_Z - 2.0, 'act1'),
-  createSkeleton(SHRINE_POS.x + 5.0, SHRINE_POS.z + 3.0, 'act2'),
-  createSkeleton(SHRINE_POS.x + 4.0, SHRINE_POS.z - 4.5, 'act2'),
-  createSkeleton(-5.5, -65.0, 'open'),
-  createSkeleton(5.5, -65.0, 'open'),
+// Diverse Biome Mobs across the whole 180x180 Valley (Story + Open World!)
+const mobs = [
+  // Act I — Silverstream Bridge
+  createBiomeMob(BRIDGE_X + 9.0, BRIDGE_Z + 1.4, 'swordsman', 'act1'),
+  createBiomeMob(BRIDGE_X + 9.8, BRIDGE_Z - 2.2, 'acolyte', 'act1'),
+  // Act II — Moonfall Waterfall Shrine
+  createBiomeMob(SHRINE_POS.x + 5.2, SHRINE_POS.z + 3.2, 'stalker', 'act2'),
+  createBiomeMob(SHRINE_POS.x + 4.2, SHRINE_POS.z - 4.2, 'necro', 'act2'),
+  // Sunscorch Barrens — Sunken Sand Temple (Both Modes!)
+  createBiomeMob(DESERT_TEMPLE_POS.x - 13, DESERT_TEMPLE_POS.z + 2, 'tombguard', 'roam'),
+  createBiomeMob(DESERT_TEMPLE_POS.x - 10, DESERT_TEMPLE_POS.z - 8, 'pyro', 'roam'),
+  // Shiverpeak Frostlands — Frost Sanctum (Both Modes!)
+  createBiomeMob(SNOW_MONUMENT_POS.x + 11, SNOW_MONUMENT_POS.z + 3, 'raider', 'roam'),
+  createBiomeMob(SNOW_MONUMENT_POS.x + 6, SNOW_MONUMENT_POS.z + 11, 'wraith', 'roam'),
+  // Deepwood Canopy & Misty Fenlands (South)
+  createBiomeMob(4, 42, 'brute', 'roam'),
+  createBiomeMob(-34, 42, 'stalker', 'roam'),
 ];
 const warden = createWarden(KEEP_POS.x, KEEP_POS.z);
 
-// Pre-allocated Orb Pool (14)
+// Pre-allocated Orb & Ground Ring Pools
 const sharedOrbGeo = new THREE.SphereGeometry(0.38, 10, 10);
 const orbPool = Array.from({ length: 14 }, () => {
   const mesh = new THREE.Mesh(sharedOrbGeo, new THREE.MeshBasicMaterial({ color: 0xff5511 }));
   mesh.visible = false;
   scene.add(mesh);
-  return { active: false, mesh, colorHex: 0xff5511, vel: new THREE.Vector3(), reflected: false, owner: null };
+  return { active: false, mesh, colorHex: 0xff5511, vel: new THREE.Vector3(), reflected: false, owner: null, dmg: 16 };
 });
 
-// Pre-allocated Ground Ring Pool (6)
 const sharedRingGeo = new THREE.RingGeometry(1.75, 2.2, 28);
 const ringPool = Array.from({ length: 6 }, () => {
   const mesh = new THREE.Mesh(
@@ -721,48 +1009,7 @@ const ringPool = Array.from({ length: 6 }, () => {
   return { active: false, mesh, timer: 0, maxTimer: 1.35 };
 });
 
-// 1-Draw-Call Instanced Spark Pool (140)
-const MAX_SPARKS = 140;
-const sparkMesh = new THREE.InstancedMesh(
-  new THREE.BoxGeometry(0.17, 0.17, 0.17),
-  new THREE.MeshBasicMaterial({ color: 0xffffff }),
-  MAX_SPARKS
-);
-sparkMesh.frustumCulled = false;
-const dummy = new THREE.Object3D();
-const tmpCol = new THREE.Color(0xffffff);
-for (let i = 0; i < MAX_SPARKS; i++) {
-  dummy.scale.setScalar(0);
-  dummy.updateMatrix();
-  sparkMesh.setMatrixAt(i, dummy.matrix);
-  sparkMesh.setColorAt(i, tmpCol);
-}
-sparkMesh.instanceMatrix.needsUpdate = true;
-sparkMesh.instanceColor.needsUpdate = true;
-scene.add(sparkMesh);
-
-const sparkData = Array.from({ length: MAX_SPARKS }, () => ({
-  active: false, pos: new THREE.Vector3(), vel: new THREE.Vector3(), life: 0, maxLife: 0.45,
-}));
-let sparkCursor = 0;
-
-function spawnSparks(pos, hex, count = 12, spread = 8, upBoost = 4.5) {
-  tmpCol.setHex(hex);
-  for (let i = 0; i < count; i++) {
-    const idx = sparkCursor;
-    sparkCursor = (sparkCursor + 1) % MAX_SPARKS;
-    const s = sparkData[idx];
-    s.active = true;
-    s.pos.set(pos.x, Math.max(pos.y, 0.25), pos.z);
-    s.vel.set((Math.random() - 0.5) * spread, 1.5 + Math.random() * upBoost, (Math.random() - 0.5) * spread);
-    s.maxLife = 0.38 + Math.random() * 0.22;
-    s.life = s.maxLife;
-    sparkMesh.setColorAt(idx, tmpCol);
-  }
-  sparkMesh.instanceColor.needsUpdate = true;
-}
-
-// Story Mode Golden Spirit Trail & Sky Beacon
+// Story Mode Spirit Trail & Beacon
 const trailCount = 56;
 const trailGeo = new THREE.BufferGeometry();
 const trailPos = new Float32Array(trailCount * 3);
@@ -782,19 +1029,34 @@ objectiveBeacon.visible = false;
 scene.add(objectiveBeacon);
 
 // =========================================================
-// 6. GAMEPLAY STATE, STORY MODE & MENU WIRING
+// 7. COMBAT, HEALING (SLOW REGEN + 25% ON KILL) & GAME STATE
 // =========================================================
 let appState = 'menu';
 let gameMode = null;
 let storyStage = 0;
 let runTime = 0;
 
-let playerHP = 5;
+const MAX_HP = 100;
+let playerHP = MAX_HP;
+let timeSinceDamage = 10;
+let playerIFrames = 0;
+let playerRedTint = 0;
 let parries = 0;
+
+// Sword 3-hit combo state
+let swordSwingTimer = 0;
+let swordCooldown = 0;
+let comboStep = 0;
+let comboResetTimer = 0;
+
+// Shield & Dash state
 let parryTimer = 0;
 let parryCooldown = 0;
 let dashTimer = 0;
 let dashCooldown = 0;
+let dashAfterimageTick = 0;
+let skidTimer = 0;
+
 let hitstop = 0;
 let shake = 0;
 let isMounted = false;
@@ -805,42 +1067,19 @@ const keys = {};
 const msgEl = document.getElementById('msg');
 const storyObjectivePos = new THREE.Vector3();
 
-function getActivePos() {
-  return isMounted ? horse.root.position : knight.group.position;
-}
-function getActiveYaw() {
-  return isMounted ? horse.yaw : knight.yaw;
-}
+function getActivePos() { return isMounted ? horse.root.position : knight.group.position; }
+function getActiveYaw() { return isMounted ? horse.yaw : knight.yaw; }
 
 function flashMsg(text) {
   if (!msgEl) return;
   msgEl.textContent = text;
-  setTimeout(() => { if (msgEl.textContent === text) msgEl.textContent = ''; }, 1700);
+  setTimeout(() => { if (msgEl.textContent === text) msgEl.textContent = ''; }, 1600);
 }
 
 function clearProjectiles() {
   orbPool.forEach((o) => { o.active = false; o.mesh.visible = false; });
   ringPool.forEach((r) => { r.active = false; r.mesh.visible = false; });
   orbLightPool.forEach((l) => { l.intensity = 0; });
-}
-
-function setStoryStage(stage) {
-  storyStage = stage;
-  if (stage === 1) {
-    ui.setObjective('<b>ACT I &mdash; SILVERSTREAM BRIDGE</b>Follow the golden trail west and bounce back the Sentinels&rsquo; bolts.');
-    storyObjectivePos.set(BRIDGE_X + 8.5, 0, BRIDGE_Z);
-  } else if (stage === 2) {
-    ui.setObjective('<b>ACT II &mdash; MOONFALL SHRINE</b>Cross the arched bridge above the stream and cleanse the Waterfall Shrine.');
-    storyObjectivePos.copy(SHRINE_POS);
-  } else if (stage === 3) {
-    ui.setObjective('<b>ACT III &mdash; BEYOND THE GATE</b>Ride north through Citadel Gate &amp; Ashenbrook Village to confront the Warden.');
-    storyObjectivePos.copy(KEEP_POS);
-  } else if (stage === 4) {
-    ui.setObjective(`<b>DAWN RETURNS</b>Cleared in ${Math.floor(runTime)}s &middot; ${parries} Parries. Press [ESC] for Open World.`);
-    spiritTrail.visible = false;
-    objectiveBeacon.visible = false;
-  }
-  objectiveBeacon.position.set(storyObjectivePos.x, 8, storyObjectivePos.z);
 }
 
 function refreshStatus() {
@@ -851,13 +1090,167 @@ function refreshStatus() {
       : '[H] CALL HORSE';
   ui.updateStatus({
     hp: playerHP,
-    maxHp: 5,
+    maxHp: MAX_HP,
     parries,
     mountLabel,
-    showBoss: gameMode === 'story' && storyStage === 3 && warden.hp > 0,
+    isRegening: playerHP < MAX_HP && timeSinceDamage >= 4.0,
+    showBoss: gameMode === 'story' && storyStage === 3 && warden.hp > 0 && warden.spawned,
     bossHp: warden.hp,
     bossMax: warden.maxHp,
   });
+}
+
+// Curated Healing Effect: 25% Instant Heal on Hostile Mob Kill
+function healOnKill(pos) {
+  const healAmt = Math.round(MAX_HP * 0.25);
+  playerHP = Math.min(MAX_HP, playerHP + healAmt);
+  ui.triggerHealFlash();
+  ui.spawnFloatText(pos, `+${healAmt}`, '#66ffbb', true);
+
+  // Two expanding mint ground rings + fading Light Pillar
+  spawnExpandingRing(pos, 0x66ffbb, 3.4, 0.48);
+  setTimeout(() => spawnExpandingRing(getActivePos(), 0x99ffdd, 4.4, 0.52), 90);
+  healPillar.position.set(pos.x, pos.y + 6.5, pos.z);
+  healPillar.visible = true;
+  healPillarTimer = 0.45;
+  refreshStatus();
+}
+
+// Curated Taking-Damage Effects: Knockback + Blink I-Frames + Red Vignette + Red Tint
+function damagePlayer(amount, sourcePos) {
+  if (playerIFrames > 0 || dashTimer > 0) return;
+  playerHP = Math.max(0, playerHP - amount);
+  timeSinceDamage = 0;
+  playerIFrames = 0.65;
+  playerRedTint = 0.3;
+  shake = 0.65;
+
+  const p = getActivePos();
+  ui.triggerDamageUI();
+  ui.spawnFloatText(p, `-${amount}`, '#ff5555', false);
+  spawnParticles(p, 0xff4433, 12, { spread: 8, upRand: 4 });
+
+  // Knockback away from attacker
+  if (sourcePos && !isMounted) {
+    const kb = new THREE.Vector3(p.x - sourcePos.x, 0, p.z - sourcePos.z);
+    if (kb.lengthSq() > 0.001) kb.normalize().multiplyScalar(11.5);
+    knight.knockVel.copy(kb);
+  }
+
+  if (playerHP <= 0) respawnPlayer();
+  refreshStatus();
+}
+
+// Curated Hit-Feedback & Enemy Defeat Effects
+function damageMob(mob, amount, fromPos, isHeavy = false) {
+  if (mob.hp <= 0) return;
+  mob.hp = Math.max(0, mob.hp - amount);
+  mob.hitFlash = 0.1; // White Flash for ~4 frames
+  mob.stagger = Math.max(mob.stagger, isHeavy ? 0.38 : 0.22);
+
+  // Knockback
+  const kb = new THREE.Vector3(mob.group.position.x - fromPos.x, 0, mob.group.position.z - fromPos.z);
+  if (kb.lengthSq() > 0.001) kb.normalize().multiplyScalar(mob.isBoss ? 3.5 : isHeavy ? 11.0 : 7.5);
+  mob.knockVel.copy(kb);
+
+  // Hit Stop + Screen Shake + Spark Burst + Floating Damage Number
+  hitstop = isHeavy ? 0.07 : 0.045;
+  shake = Math.max(shake, isHeavy ? 0.6 : 0.35);
+  ui.spawnFloatText(mob.group.position, `${amount}`, isHeavy ? '#66ffee' : '#ffe066', isHeavy);
+  spawnParticles(mob.group.position, isHeavy ? 0x66ffee : 0xffcc55, isHeavy ? 16 : 11, { spread: 9, upRand: 5 });
+
+  if (mob.hp <= 0) {
+    mob.group.visible = false;
+    const p = mob.group.position;
+
+    // 1) Ash / Pixel Dissolve (floating upward embers)
+    spawnParticles(p, mob.accentHex, 18, { spread: 4.5, upMin: 2.2, upRand: 4.0, gravity: -1.8, life: 0.9, scale: 0.85 });
+    // 2) Chunk Burst (spinning shards bouncing on the ground for heavy mobs & boss)
+    if (mob.heavy) {
+      spawnParticles(p, 0xc8c2b4, 14, { spread: 10, upMin: 3.5, upRand: 5.5, gravity: 18, life: 0.85, bounce: true, scale: 1.35 });
+    }
+    // 3) Soul Rise (pale swaying wisp floating up)
+    spawnSoulRise(p);
+
+    // 25% Instant Heal on Hostile Mob Defeat!
+    healOnKill(getActivePos());
+
+    if (mob.isBoss) {
+      scene.background.setHex(0x2e1c11);
+      scene.fog.color.setHex(0x2e1c11);
+      moonLight.color.setHex(0xffd28a);
+      setStoryStage(4);
+      ui.showDialogue(`THE WARDEN FALLS! DAWN RETURNS TO ASHENBROOK AND THE VALLEY. (${Math.floor(runTime)}s · ${parries} PARRIES)`, 8.5);
+    } else {
+      flashMsg(`${mob.name.toUpperCase()} DEFEATED!`);
+    }
+  }
+  refreshStatus();
+}
+
+// Detailed Broadsword 3-Hit Combo Slash
+function triggerSwordAttack() {
+  if (appState !== 'playing' || swordCooldown > 0) return;
+  comboStep = comboResetTimer > 0 ? (comboStep % 3) + 1 : 1;
+  comboResetTimer = 0.85;
+  swordSwingTimer = 0.24;
+  swordCooldown = comboStep === 3 ? 0.42 : 0.28;
+
+  const p = getActivePos();
+  const yaw = getActiveYaw();
+  const fwdX = Math.sin(yaw);
+  const fwdZ = Math.cos(yaw);
+
+  // Subtle forward lunge on foot
+  if (!isMounted) knight.speed = Math.max(knight.speed, 9.5);
+
+  // Orient glowing slash arc
+  knight.slashArc.rotation.z = comboStep === 2 ? -0.35 : 0.35;
+  knight.slashArc.scale.setScalar(comboStep === 3 ? 1.25 : 1.0);
+  knight.slashArc.material.color.setHex(comboStep === 3 ? 0x66ffee : 0xd8f6ff);
+  knight.slashArc.material.opacity = 0.9;
+
+  // Hit detection in a generous forward cleave cone
+  const reach = (isMounted ? 4.4 : 3.7) + (comboStep === 3 ? 0.6 : 0);
+  const baseDmg = comboStep === 3 ? 34 : 22;
+
+  const targets = [...mobs, warden];
+  targets.forEach((m) => {
+    if (!m.group.visible || !m.spawned || m.hp <= 0) return;
+    const dx = m.group.position.x - p.x;
+    const dz = m.group.position.z - p.z;
+    const dist = Math.hypot(dx, dz);
+    if (dist > reach) return;
+    const dot = (dx * fwdX + dz * fwdZ) / (dist || 1);
+    if (dot > -0.15 || dist < 1.6) {
+      damageMob(m, baseDmg, p, comboStep === 3);
+    }
+  });
+}
+
+function triggerParry() {
+  if (appState !== 'playing' || parryCooldown > 0) return;
+  parryTimer = 0.32;
+  parryCooldown = 0.55;
+}
+
+function setStoryStage(stage) {
+  storyStage = stage;
+  if (stage === 1) {
+    ui.setObjective('<b>ACT I &mdash; SILVERSTREAM BRIDGE</b>Slay or parry the Bridge Guardians with [LMB/F] Sword &amp; [SPACE] Shield.');
+    storyObjectivePos.set(BRIDGE_X + 8.5, 0, BRIDGE_Z);
+  } else if (stage === 2) {
+    ui.setObjective('<b>ACT II &mdash; MOONFALL SHRINE</b>Cross Silverstream Bridge and cleanse the Waterfall Shrine Guardians.');
+    storyObjectivePos.copy(SHRINE_POS);
+  } else if (stage === 3) {
+    ui.setObjective('<b>ACT III &mdash; BEYOND THE GATE</b>Ride north through Citadel Gate &amp; Ashenbrook Village to face the Warden.');
+    storyObjectivePos.copy(KEEP_POS);
+  } else if (stage === 4) {
+    ui.setObjective(`<b>DAWN RETURNS</b>Cleared in ${Math.floor(runTime)}s &middot; ${parries} Parries. Press [ESC] for Open World.`);
+    spiritTrail.visible = false;
+    objectiveBeacon.visible = false;
+  }
+  objectiveBeacon.position.set(storyObjectivePos.x, 8, storyObjectivePos.z);
 }
 
 function resetWorldForMode(mode) {
@@ -867,7 +1260,10 @@ function resetWorldForMode(mode) {
   ui.resetArea();
 
   clearProjectiles();
-  playerHP = 5;
+  playerHP = MAX_HP;
+  timeSinceDamage = 10;
+  playerIFrames = 0;
+  playerRedTint = 0;
   parries = 0;
   runTime = 0;
   storyStage = 0;
@@ -884,17 +1280,30 @@ function resetWorldForMode(mode) {
   knight.group.position.set(-1.5, 0, 12);
   knight.yaw = 0;
   knight.speed = 0;
+  knight.knockVel.set(0, 0, 0);
   horse.root.position.set(-5.0, 0, 10.5);
   horse.speed = 0;
   horse.calling = false;
 
-  skeletons.forEach((s) => {
-    s.group.position.set(s.homeX, getWalkableY(s.homeX, s.homeZ), s.homeZ);
-    s.hp = s.maxHp;
-    s.group.visible = mode === 'story' ? (s.role === 'act1' || s.role === 'act2') : s.role === 'open';
+  // Reset mobs — they stay dormant until player enters range, then Rise from Ground / Summon Circle!
+  mobs.forEach((m) => {
+    m.hp = m.maxHp;
+    m.stagger = 0;
+    m.windup = 0;
+    m.hitFlash = 0;
+    m.knockVel.set(0, 0, 0);
+    m.spawned = false;
+    m.spawnTimer = 0;
+    m.group.position.set(m.homeX, getWalkableY(m.homeX, m.homeZ), m.homeZ);
+    m.group.visible = mode === 'story' ? true : m.role === 'roam';
   });
 
   warden.hp = warden.maxHp;
+  warden.stagger = 0;
+  warden.windup = 0;
+  warden.spawned = false;
+  warden.spawnTimer = 0;
+  warden.group.position.set(warden.homeX, 0, warden.homeZ);
   warden.group.visible = mode === 'story';
 
   if (mode === 'story') {
@@ -902,13 +1311,13 @@ function resetWorldForMode(mode) {
     objectiveBeacon.visible = true;
     world.shrineCrystal.material.color.setHex(0xff5566);
     setStoryStage(1);
-    ui.showDialogue('THE VALLEY SLEEPS IN ASH. FOLLOW THE GOLDEN TRAIL WEST TO SILVERSTREAM BRIDGE — BOUNCE MAGIC BACK WITH [SPACE] OR [CLICK].', 6.0);
+    ui.showDialogue('SLAY FOES WITH [LEFT CLICK / F] BROADSWORD &amp; PARRY WITH [SPACE / RIGHT CLICK]. DEFEATING ENEMIES HEALS 25% HP.', 6.0);
   } else {
     ui.setObjective(null);
     spiritTrail.visible = false;
     objectiveBeacon.visible = false;
     world.shrineCrystal.material.color.setHex(0x55ffee);
-    ui.showDialogue('PRESS [E] TO MOUNT YOUR HORSE. EXPLORE ASHENBROOK VILLAGE NORTH OF THE GATE, MOONFALL WATERFALL, FROSTLANDS, SWAMP, JUNGLE &amp; DESERT.', 6.5);
+    ui.showDialogue('OPEN WORLD: RIDE FREELY TO ASHENBROOK VILLAGE, SAND TEMPLE (EAST) &amp; FROST SANCTUM (NW). CHECK [ESC] &rarr; CONTROLS ANYTIME.', 6.5);
   }
 
   ui.updateArea(getAreaInfo(knight.group.position.x, knight.group.position.z));
@@ -923,12 +1332,6 @@ const menu = createGameMenu({
     ui.setVisible(true);
   },
 });
-
-function triggerParry() {
-  if (appState !== 'playing' || parryCooldown > 0) return;
-  parryTimer = 0.3;
-  parryCooldown = 0.52;
-}
 
 function toggleMount() {
   if (appState !== 'playing') return;
@@ -959,15 +1362,16 @@ function toggleMount() {
   refreshStatus();
 }
 
-function spawnOrb(origin, target, colorHex, owner, speed = 7.5) {
+function spawnOrb(origin, target, colorHex, owner, speed = 7.8, dmg = 16) {
   const slot = orbPool.find((o) => !o.active);
   if (!slot) return;
   slot.active = true;
   slot.colorHex = colorHex;
   slot.reflected = false;
   slot.owner = owner;
+  slot.dmg = dmg;
   slot.mesh.material.color.setHex(colorHex);
-  slot.mesh.position.set(origin.x, origin.y + 1.3, origin.z);
+  slot.mesh.position.set(origin.x, origin.y + 1.35, origin.z);
   slot.mesh.visible = true;
   slot.vel.set(target.x - origin.x, 0, target.z - origin.z).normalize().multiplyScalar(speed);
 }
@@ -982,14 +1386,17 @@ function spawnGroundRing(x, z) {
 }
 
 function respawnPlayer() {
-  playerHP = 5;
+  playerHP = MAX_HP;
+  timeSinceDamage = 10;
+  playerIFrames = 1.2;
   const p = getActivePos();
   p.set(-1.5, 0, 12);
   if (isMounted) horse.speed = 0;
-  spawnSparks(p, 0x55ffee, 20);
+  spawnParticles(p, 0x55ffee, 22);
   flashMsg('SHATTERED — BOUNCED BACK TO BRAZIER');
 }
 
+// --- INPUT LISTENERS (SPACEBAR BUG PERMANENTLY FIXED) ---
 window.addEventListener('keydown', (e) => {
   keys[e.code] = true;
   if (e.code === 'Escape') {
@@ -1007,15 +1414,25 @@ window.addEventListener('keydown', (e) => {
     return;
   }
   if (appState !== 'playing') return;
-  if (e.code === 'Space') triggerParry();
+
+  if (e.code === 'Space') {
+    e.preventDefault(); // Prevents accidental button activation or page scroll
+    triggerParry();
+  }
+  if (e.code === 'KeyF' || e.code === 'KeyJ') triggerSwordAttack();
   if (e.code === 'KeyE') toggleMount();
   if (e.code === 'KeyH' && !isMounted) {
     horse.calling = true;
     flashMsg('WHISTLED FOR WARHORSE...');
   }
   if ((e.code === 'ShiftLeft' || e.code === 'ShiftRight') && !isMounted && dashCooldown <= 0) {
-    dashTimer = 0.16;
-    dashCooldown = 0.82;
+    dashTimer = 0.18;
+    dashCooldown = 0.8;
+    dashAfterimageTick = 0;
+    // Curated Dash Effect: Biome Dust Kick backward at dash start
+    spawnParticles(knight.group.position, getBiomeDustColor(knight.group.position.x, knight.group.position.z), 8, {
+      spread: 5.5, upMin: 1.0, upRand: 2.2, gravity: 10, life: 0.38,
+    });
   }
   if (e.code === 'Digit1') { useAscii = true; asciiPass.uniforms.uHybrid.value = 1.0; asciiPass.uniforms.uCellSize.value.set(5.5, 9.0); flashMsg('REEL HYBRID ASCII'); }
   if (e.code === 'Digit2') { useAscii = true; asciiPass.uniforms.uHybrid.value = 0.0; asciiPass.uniforms.uCellSize.value.set(5.0, 8.0); flashMsg('PURE MICRO ASCII'); }
@@ -1023,9 +1440,15 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'Digit4') { useAscii = !useAscii; flashMsg(useAscii ? 'ASCII ON' : 'RAW 3D'); }
 });
 window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+window.addEventListener('contextmenu', (e) => {
+  if (appState === 'playing') e.preventDefault();
+});
 window.addEventListener('pointerdown', (e) => {
-  if (e.target.closest('#menu-overlay')) return;
-  triggerParry();
+  if (appState !== 'playing') return;
+  if (e.target.closest('#menu-overlay') || e.target.closest('#minimap-wrap') || e.target.closest('#fullmap-overlay')) return;
+  if (e.button === 2) triggerParry();
+  else if (e.button === 0) triggerSwordAttack();
 });
 
 window.addEventListener('resize', () => {
@@ -1052,7 +1475,6 @@ function animateHorseLegs(h, dt, t) {
     h.legs.bl.knee.rotation.x = -Math.max(0, Math.cos(p + Math.PI)) * swing * 0.85;
     h.legs.br.hip.rotation.x = Math.sin(p + Math.PI + 0.65) * swing;
     h.legs.br.knee.rotation.x = -Math.max(0, Math.cos(p + Math.PI + 0.65)) * swing * 0.85;
-
     h.bodyPivot.position.y = Math.abs(Math.sin(p)) * (0.14 + speedRatio * 0.22);
     h.bodyPivot.rotation.x = Math.cos(p) * (0.05 + speedRatio * 0.11);
     h.neckPivot.rotation.x = Math.sin(p - 0.5) * (0.08 + speedRatio * 0.12);
@@ -1066,7 +1488,7 @@ function animateHorseLegs(h, dt, t) {
 }
 
 // =========================================================
-// 7. BUTTER-SMOOTH 60 FPS MAIN LOOP
+// 8. BUTTER-SMOOTH 60 FPS MAIN LOOP
 // =========================================================
 const clock = new THREE.Clock();
 let uiTimer = 0;
@@ -1080,7 +1502,7 @@ function animate() {
   const windX = Math.cos(windAngle);
   const windZ = Math.sin(windAngle);
 
-  // Cinematic Waterfall & Stream Orbit during Main Menu
+  // Cinematic Waterfall Orbit on Title Screen
   if (appState === 'menu') {
     world.updateWorld(dt, t, WATERFALL_POOL, windX, windZ, false);
     const camAngle = t * 0.13;
@@ -1099,10 +1521,10 @@ function animate() {
     return;
   }
 
-  // Hitstop Freeze
+  // Curated Hit Feedback: Hit Stop Freeze
   if (hitstop > 0) {
     hitstop -= dt;
-    asciiPass.uniforms.uFlash.value = Math.max(0, hitstop * 4.5);
+    asciiPass.uniforms.uFlash.value = Math.max(0, hitstop * 3.8);
     if (useAscii) composer.render();
     else renderer.render(scene, camera);
     return;
@@ -1112,7 +1534,28 @@ function animate() {
   if (gameMode === 'story' && storyStage < 4) runTime += dt;
   ui.tickDialogue(dt);
 
-  // --- MOVEMENT (SMOOTH HORSE OR SMOOTH ON-FOOT KNIGHT) ---
+  // Passive Slow Healing Over Time (kicks in 4s after taking damage)
+  timeSinceDamage += dt;
+  if (playerHP < MAX_HP && timeSinceDamage >= 4.0) {
+    playerHP = Math.min(MAX_HP, playerHP + 3.8 * dt);
+  }
+
+  // Player Blink I-Frames + Red Damage Tint
+  if (playerIFrames > 0) {
+    playerIFrames -= dt;
+    knight.bodyPivot.visible = Math.floor(t * 28) % 2 === 0;
+  } else {
+    knight.bodyPivot.visible = true;
+  }
+  if (playerRedTint > 0) {
+    playerRedTint -= dt;
+    const tint = Math.max(0, playerRedTint / 0.3);
+    knight.armorMats.forEach((m) => m.emissive.setRGB(tint * 0.85, 0, 0));
+  } else {
+    knight.armorMats.forEach((m) => m.emissive.setRGB(0, 0, 0));
+  }
+
+  // --- MOVEMENT (SMOOTH HORSE OR SMOOTH ON-FOOT KNIGHT + DASH EFFECTS) ---
   const inputX = (keys['KeyD'] || keys['ArrowRight'] ? 1 : 0) - (keys['KeyA'] || keys['ArrowLeft'] ? 1 : 0);
   const inputZ = (keys['KeyS'] || keys['ArrowDown'] ? 1 : 0) - (keys['KeyW'] || keys['ArrowUp'] ? 1 : 0);
   const hasInput = inputX !== 0 || inputZ !== 0;
@@ -1130,13 +1573,10 @@ function animate() {
       let diff = targetYaw - horse.yaw;
       while (diff > Math.PI) diff -= Math.PI * 2;
       while (diff < -Math.PI) diff += Math.PI * 2;
-
       const turnRate = THREE.MathUtils.lerp(4.6, 2.7, Math.min(horse.speed / 18.0, 1));
       horse.yaw += THREE.MathUtils.clamp(diff, -turnRate * dt, turnRate * dt);
       horse.bank = THREE.MathUtils.clamp(-diff * (horse.speed / 12) * 0.28, -0.26, 0.26);
-
-      const turnPenalty = Math.abs(diff) > 1.2 ? 0.45 : 1.0;
-      horse.speed = THREE.MathUtils.lerp(horse.speed, maxSpeed * turnPenalty, 1 - Math.exp(-3.4 * dt));
+      horse.speed = THREE.MathUtils.lerp(horse.speed, maxSpeed * (Math.abs(diff) > 1.2 ? 0.45 : 1.0), 1 - Math.exp(-3.4 * dt));
     } else {
       horse.bank = 0;
       horse.speed = THREE.MathUtils.lerp(horse.speed, 0, 1 - Math.exp(-4.2 * dt));
@@ -1146,69 +1586,81 @@ function animate() {
     const nx = THREE.MathUtils.clamp(horse.root.position.x + Math.sin(horse.yaw) * horse.speed * dt, -84, 84);
     const nz = THREE.MathUtils.clamp(horse.root.position.z + Math.cos(horse.yaw) * horse.speed * dt, -82, 82);
     const blocked = world.colliders.some((c) => Math.hypot(nx - c.x, nz - c.z) < c.r + 0.9);
-    if (!blocked) {
-      horse.root.position.x = nx;
-      horse.root.position.z = nz;
-    } else {
-      horse.speed *= 0.35;
-    }
-    horse.root.position.y = THREE.MathUtils.lerp(
-      horse.root.position.y,
-      getWalkableY(horse.root.position.x, horse.root.position.z),
-      1 - Math.exp(-14 * dt)
-    );
+    if (!blocked) { horse.root.position.x = nx; horse.root.position.z = nz; }
+    else horse.speed *= 0.35;
+
+    horse.root.position.y = THREE.MathUtils.lerp(horse.root.position.y, getWalkableY(horse.root.position.x, horse.root.position.z), 1 - Math.exp(-14 * dt));
     horse.root.rotation.y = horse.yaw;
     currentMoveSpeed = horse.speed;
 
     if (horse.speed > 4.5 && splashCooldown <= 0) {
-      if (inRiver) spawnSparks(horse.root.position, 0xdff5ff, 6, 6.5, 4.2);
-      else if (horse.speed > 11.5) spawnSparks(horse.root.position, 0x3b5944, 3, 4.0, 2.2);
+      if (inRiver) spawnParticles(horse.root.position, 0xdff5ff, 5, { spread: 6, upRand: 4 });
+      else if (horse.speed > 11.5) spawnParticles(horse.root.position, getBiomeDustColor(nx, nz), 3, { spread: 4, upRand: 2 });
       splashCooldown = 0.09;
     }
   } else {
     if (dashCooldown > 0) dashCooldown -= dt;
-    const targetSpeed = hasInput ? (dashTimer > 0 ? 18.0 : 8.0) : 0;
-    if (dashTimer > 0) dashTimer -= dt;
+    const wasDashing = dashTimer > 0;
+    if (dashTimer > 0) {
+      dashTimer -= dt;
+      // Curated Dash Effect: Mint Afterimages every 0.035s
+      dashAfterimageTick -= dt;
+      if (dashAfterimageTick <= 0) {
+        dashAfterimageTick = 0.035;
+        spawnAfterimage(knight.group.position, knight.yaw);
+      }
+      if (dashTimer <= 0 && wasDashing) {
+        // Curated Dash Effect: Skid Stop lean-back + foot sparks
+        skidTimer = 0.16;
+        spawnParticles(knight.group.position, 0xbbeeff, 7, { spread: 6, upMin: 0.6, upRand: 2.2, life: 0.3 });
+      }
+    }
 
-    knight.speed = THREE.MathUtils.lerp(knight.speed, targetSpeed, 1 - Math.exp(-11 * dt));
+    const targetSpeed = hasInput ? (dashTimer > 0 ? 19.0 : 8.2) : (dashTimer > 0 ? 17.5 : 0);
+    knight.speed = THREE.MathUtils.lerp(knight.speed, targetSpeed, 1 - Math.exp(-12 * dt));
 
     if (hasInput) {
       const targetYaw = Math.atan2(inputX, inputZ);
       let diff = targetYaw - knight.yaw;
       while (diff > Math.PI) diff -= Math.PI * 2;
       while (diff < -Math.PI) diff += Math.PI * 2;
-
       knight.yaw += diff * (1 - Math.exp(-11.5 * dt));
       knight.bank = THREE.MathUtils.lerp(knight.bank, THREE.MathUtils.clamp(-diff * 0.25, -0.22, 0.22), 1 - Math.exp(-10 * dt));
     } else {
       knight.bank = THREE.MathUtils.lerp(knight.bank, 0, 1 - Math.exp(-10 * dt));
     }
 
-    if (knight.speed > 0.15) {
-      const nx = THREE.MathUtils.clamp(knight.group.position.x + Math.sin(knight.yaw) * knight.speed * dt, -84, 84);
-      const nz = THREE.MathUtils.clamp(knight.group.position.z + Math.cos(knight.yaw) * knight.speed * dt, -82, 82);
+    // Apply Knockback Decay
+    const vx = Math.sin(knight.yaw) * knight.speed + knight.knockVel.x;
+    const vz = Math.cos(knight.yaw) * knight.speed + knight.knockVel.z;
+    knight.knockVel.multiplyScalar(Math.exp(-10 * dt));
+
+    if (Math.hypot(vx, vz) > 0.15) {
+      const nx = THREE.MathUtils.clamp(knight.group.position.x + vx * dt, -84, 84);
+      const nz = THREE.MathUtils.clamp(knight.group.position.z + vz * dt, -82, 82);
       const blocked = world.colliders.some((c) => Math.hypot(nx - c.x, nz - c.z) < c.r + 0.55);
-      if (!blocked) {
-        knight.group.position.x = nx;
-        knight.group.position.z = nz;
-      }
-      knight.group.position.y = THREE.MathUtils.lerp(
-        knight.group.position.y,
-        getWalkableY(knight.group.position.x, knight.group.position.z),
-        1 - Math.exp(-15 * dt)
-      );
+      if (!blocked) { knight.group.position.x = nx; knight.group.position.z = nz; }
+      knight.group.position.y = THREE.MathUtils.lerp(knight.group.position.y, getWalkableY(knight.group.position.x, knight.group.position.z), 1 - Math.exp(-15 * dt));
       knight.leftLeg.rotation.x = Math.sin(t * 13) * 0.55;
       knight.rightLeg.rotation.x = -Math.sin(t * 13) * 0.55;
       knight.bodyPivot.position.y = Math.abs(Math.sin(t * 13)) * 0.08;
 
       if (isInWater(nx, nz) && splashCooldown <= 0) {
-        spawnSparks(knight.group.position, 0xdff5ff, 3, 3.8, 2.5);
+        spawnParticles(knight.group.position, 0xdff5ff, 3, { spread: 3.8, upRand: 2.5 });
         splashCooldown = 0.16;
       }
     } else {
       knight.leftLeg.rotation.x *= 0.82;
       knight.rightLeg.rotation.x *= 0.82;
       knight.bodyPivot.position.y *= 0.85;
+    }
+
+    // Skid Stop backward pitch
+    if (skidTimer > 0) {
+      skidTimer -= dt;
+      knight.bodyPivot.rotation.x = THREE.MathUtils.lerp(knight.bodyPivot.rotation.x, -0.32, 0.45);
+    } else {
+      knight.bodyPivot.rotation.x = THREE.MathUtils.lerp(knight.bodyPivot.rotation.x, 0, 0.25);
     }
 
     knight.group.rotation.y = knight.yaw;
@@ -1238,37 +1690,61 @@ function animate() {
     }
   }
 
-  const playerPos = getActivePos();
-  world.updateWorld(dt, t, playerPos, windX, windZ, true);
-  animateHorseLegs(horse, dt, t);
-  updateHorseHair(horse, dt, t, windX, windZ);
-  updateKnightCape(knight, dt, t, windX, windZ, currentMoveSpeed);
+  // Animate Broadsword 3-Hit Swing & Glowing Slash Arc
+  if (swordCooldown > 0) swordCooldown -= dt;
+  if (comboResetTimer > 0) comboResetTimer -= dt;
+  if (swordSwingTimer > 0) {
+    swordSwingTimer -= dt;
+    const prog = 1 - swordSwingTimer / 0.24;
+    if (comboStep === 1) {
+      knight.swordPivot.rotation.y = THREE.MathUtils.lerp(-1.5, 1.35, prog);
+      knight.swordPivot.rotation.x = -0.5;
+    } else if (comboStep === 2) {
+      knight.swordPivot.rotation.y = THREE.MathUtils.lerp(1.4, -1.45, prog);
+      knight.swordPivot.rotation.x = -0.35;
+    } else {
+      knight.swordPivot.rotation.x = THREE.MathUtils.lerp(-1.85, 0.75, prog);
+      knight.swordPivot.rotation.y = 0;
+    }
+    knight.slashArc.material.opacity = Math.max(0, (1 - prog) * 0.85);
+    knight.slashArc.rotation.z += (comboStep === 2 ? -6.5 : 6.5) * dt;
+  } else {
+    knight.swordPivot.rotation.x = THREE.MathUtils.lerp(knight.swordPivot.rotation.x, 0.15, 0.22);
+    knight.swordPivot.rotation.y = THREE.MathUtils.lerp(knight.swordPivot.rotation.y, 0.0, 0.22);
+    knight.slashArc.material.opacity = 0;
+  }
 
-  // Parry Shield Glow
+  // Shield Parry Visual
   if (parryCooldown > 0) parryCooldown -= dt;
   if (parryTimer > 0) {
     parryTimer -= dt;
     knight.shieldRing.material.opacity = 0.92;
-    knight.shieldRing.scale.setScalar(1.0 + (0.3 - parryTimer) * 1.4);
+    knight.shieldRing.scale.setScalar(1.0 + (0.32 - parryTimer) * 1.4);
     knight.shieldGlow.intensity = 18;
-    knight.shieldGroup.position.z = 0.42;
+    knight.shieldGroup.position.z = 0.45;
   } else {
     knight.shieldRing.material.opacity = 0;
     knight.shieldGlow.intensity = 0;
     knight.shieldGroup.position.z = 0.26;
   }
 
+  const playerPos = getActivePos();
+  world.updateWorld(dt, t, playerPos, windX, windZ, true);
+  animateHorseLegs(horse, dt, t);
+  updateHorseHair(horse, dt, t, windX, windZ);
+  updateKnightCape(knight, dt, t, windX, windZ, currentMoveSpeed);
+
   // --- STORY MODE PROGRESSION & SPIRIT TRAIL ---
   if (gameMode === 'story' && storyStage < 4) {
-    if (storyStage === 1 && skeletons.filter((s) => s.role === 'act1' && s.hp > 0).length === 0) {
+    if (storyStage === 1 && mobs.filter((m) => m.role === 'act1' && m.hp > 0).length === 0) {
       setStoryStage(2);
       ui.showDialogue('THE BRIDGE IS CLEAR! CROSS SILVERSTREAM BRIDGE ABOVE THE STREAM TO MOONFALL SHRINE.', 5.5);
-    } else if (storyStage === 2 && skeletons.filter((s) => s.role === 'act2' && s.hp > 0).length === 0 && playerPos.distanceTo(world.shrineGroup.position) < 9.5) {
+    } else if (storyStage === 2 && mobs.filter((m) => m.role === 'act2' && m.hp > 0).length === 0 && playerPos.distanceTo(world.shrineGroup.position) < 9.5) {
       world.shrineCrystal.material.color.setHex(0x66ffee);
       world.shrineCrystal.getWorldPosition(_tmpPos);
-      spawnSparks(_tmpPos, 0x66ffee, 28, 10, 6);
+      spawnParticles(_tmpPos, 0x66ffee, 26, { spread: 10, upRand: 6 });
       setStoryStage(3);
-      ui.showDialogue('SHRINE AWAKENED! RIDE THROUGH CITADEL GATE AND ASHENBROOK VILLAGE TO DEFEAT THE WARDEN.', 6.0);
+      ui.showDialogue('SHRINE AWAKENED! RIDE THROUGH CITADEL GATE &amp; ASHENBROOK VILLAGE TO DEFEAT THE WARDEN.', 6.0);
     }
 
     const tp = spiritTrail.geometry.attributes.position.array;
@@ -1284,69 +1760,207 @@ function animate() {
     spiritTrail.geometry.attributes.position.needsUpdate = true;
   }
 
-  // --- MOBS & WARDEN AI ---
-  skeletons.forEach((s) => {
-    if (!s.group.visible || s.hp <= 0) return;
-    const dist = s.group.position.distanceTo(playerPos);
-    if (dist > 22) return;
+  // --- BIOME MOBS AI (RISE FROM GROUND / SUMMON CIRCLE + MELEE & RANGED COMBAT) ---
+  mobs.forEach((m) => {
+    if (!m.group.visible || m.hp <= 0) return;
 
-    s.group.lookAt(playerPos.x, s.group.position.y, playerPos.z);
-    if (dist < 18 && dist > 6.2) {
-      const dx = (playerPos.x - s.group.position.x) / dist;
-      const dz = (playerPos.z - s.group.position.z) / dist;
-      const nx = s.group.position.x + dx * 2.4 * dt;
-      const nz = s.group.position.z + dz * 2.4 * dt;
-      if (!isInWater(nx, nz)) s.group.position.set(nx, getWalkableY(nx, nz), nz);
-      s.leftLeg.rotation.x = Math.sin(t * 9) * 0.45;
-      s.rightLeg.rotation.x = -Math.sin(t * 9) * 0.45;
+    // White Hit Flash update
+    if (m.hitFlash > 0) {
+      m.hitFlash -= dt;
+      m.flashMats.forEach((mat) => mat.emissive.setHex(0xffffff));
+    } else {
+      m.flashMats.forEach((mat) => mat.emissive.setHex(0x000000));
     }
-    if (dist < 16.5) {
-      s.fireTimer -= dt;
-      if (s.fireTimer <= 0) {
-        spawnOrb(s.group.position, playerPos, 0x55ff55, s, 7.2);
-        s.fireTimer = 2.6 + Math.random();
+
+    const dist = m.group.position.distanceTo(playerPos);
+
+    // Trigger Curated Spawn Effect when player enters range!
+    if (!m.spawned) {
+      if (dist < 22) {
+        m.spawned = true;
+        m.spawnTimer = 0.55;
+        if (m.combat === 'ranged') {
+          spawnExpandingRing(m.group.position, m.accentHex, 2.8, 0.55); // Summon Circle
+        } else {
+          spawnParticles(m.group.position, getBiomeDustColor(m.homeX, m.homeZ), 12, { spread: 6, upMin: 2.0, upRand: 3.5 }); // Rise from Ground
+        }
+      } else {
+        return;
+      }
+    }
+
+    if (m.spawnTimer > 0) {
+      m.spawnTimer -= dt;
+      const p = 1 - m.spawnTimer / 0.55;
+      const baseY = getWalkableY(m.group.position.x, m.group.position.z);
+      m.group.position.y = baseY - (1 - p) * 2.1;
+      return;
+    }
+
+    if (dist > 28) return;
+
+    // Apply Knockback & Stagger
+    if (m.knockVel.lengthSq() > 0.05) {
+      m.group.position.x += m.knockVel.x * dt;
+      m.group.position.z += m.knockVel.z * dt;
+      m.group.position.y = getWalkableY(m.group.position.x, m.group.position.z);
+      m.knockVel.multiplyScalar(Math.exp(-9 * dt));
+    }
+    if (m.stagger > 0) {
+      m.stagger -= dt;
+      return;
+    }
+
+    m.group.lookAt(playerPos.x, m.group.position.y, playerPos.z);
+
+    if (m.combat === 'melee') {
+      if (m.windup > 0) {
+        m.windup -= dt;
+        m.weaponArm.rotation.x = THREE.MathUtils.lerp(-1.9, 0.9, 1 - m.windup / 0.45);
+        if (m.windup <= 0) {
+          if (dist < 3.1) {
+            if (parryTimer > 0) {
+              // MELEE PARRY! Staggers mob, bounces sparks & deals counter-damage!
+              parries++;
+              flashMsg('>> MELEE PARRIED! <<');
+              damageMob(m, 30, playerPos, true);
+            } else {
+              damagePlayer(m.dmg, m.group.position);
+            }
+          }
+          m.atkTimer = 1.35 + Math.random() * 0.4;
+        }
+      } else {
+        m.weaponArm.rotation.x = THREE.MathUtils.lerp(m.weaponArm.rotation.x, 0, 0.2);
+        if (dist > 2.3) {
+          const dx = (playerPos.x - m.group.position.x) / dist;
+          const dz = (playerPos.z - m.group.position.z) / dist;
+          const nx = m.group.position.x + dx * m.speed * dt;
+          const nz = m.group.position.z + dz * m.speed * dt;
+          if (!isInWater(nx, nz)) m.group.position.set(nx, getWalkableY(nx, nz), nz);
+          m.leftLeg.rotation.x = Math.sin(t * 10) * 0.5;
+          m.rightLeg.rotation.x = -Math.sin(t * 10) * 0.5;
+        } else {
+          m.atkTimer -= dt;
+          if (m.atkTimer <= 0) {
+            m.windup = 0.45; // Visible melee telegraph before strike
+            spawnParticles(m.group.position, m.accentHex, 4, { spread: 3, upRand: 2, life: 0.25 });
+          }
+        }
+      }
+    } else {
+      // Ranged Caster Mob
+      if (dist > 7.0 && dist < 21) {
+        const dx = (playerPos.x - m.group.position.x) / dist;
+        const dz = (playerPos.z - m.group.position.z) / dist;
+        const nx = m.group.position.x + dx * m.speed * dt;
+        const nz = m.group.position.z + dz * m.speed * dt;
+        if (!isInWater(nx, nz)) m.group.position.set(nx, getWalkableY(nx, nz), nz);
+        m.leftLeg.rotation.x = Math.sin(t * 8) * 0.4;
+        m.rightLeg.rotation.x = -Math.sin(t * 8) * 0.4;
+      }
+      if (dist < 18.5) {
+        m.atkTimer -= dt;
+        if (m.atkTimer <= 0) {
+          spawnOrb(m.group.position, playerPos, m.accentHex, m, 7.6, m.dmg);
+          m.atkTimer = 2.5 + Math.random() * 0.8;
+        }
       }
     }
   });
 
+  // --- HYBRID WARDEN BOSS AI (MELEE GREATSWORD + FIREBALLS + FIRE RINGS) ---
   if (warden.group.visible && warden.hp > 0) {
+    if (warden.hitFlash > 0) {
+      warden.hitFlash -= dt;
+      warden.flashMats.forEach((mat) => mat.emissive.setHex(0xffffff));
+    } else {
+      warden.flashMats.forEach((mat) => mat.emissive.setHex(0x000000));
+    }
+
     warden.halo.rotation.z = t * 1.8;
-    warden.group.lookAt(playerPos.x, 0, playerPos.z);
-    if (warden.group.position.distanceTo(playerPos) < 22) {
-      warden.fireTimer -= dt;
-      if (warden.fireTimer <= 0) {
-        const enraged = warden.hp <= 3;
-        spawnOrb(warden.group.position, playerPos, 0xff5511, warden, enraged ? 10.2 : 8.5);
-        warden.fireTimer = enraged ? 1.45 : 2.1;
-      }
-      warden.ringTimer -= dt;
-      if (warden.ringTimer <= 0) {
-        spawnGroundRing(playerPos.x, playerPos.z);
-        warden.ringTimer = warden.hp <= 3 ? 3.4 : 4.3;
+    const bossDist = warden.group.position.distanceTo(playerPos);
+
+    if (!warden.spawned && bossDist < 26) {
+      warden.spawned = true;
+      warden.spawnTimer = 0.7;
+      spawnExpandingRing(warden.group.position, 0xff5522, 5.2, 0.7);
+      refreshStatus();
+    }
+
+    if (warden.spawned) {
+      if (warden.spawnTimer > 0) {
+        warden.spawnTimer -= dt;
+        warden.group.position.y = -(warden.spawnTimer / 0.7) * 3.2;
+      } else {
+        warden.group.position.y = 0;
+        warden.group.lookAt(playerPos.x, 0, playerPos.z);
+
+        if (warden.knockVel.lengthSq() > 0.05) {
+          warden.group.position.x += warden.knockVel.x * dt;
+          warden.group.position.z += warden.knockVel.z * dt;
+          warden.knockVel.multiplyScalar(Math.exp(-8 * dt));
+        }
+
+        if (bossDist < 25) {
+          const enraged = warden.hp <= warden.maxHp * 0.5;
+          // Close-range greatsword cleave
+          if (warden.windup > 0) {
+            warden.windup -= dt;
+            warden.weaponArm.rotation.x = THREE.MathUtils.lerp(-2.0, 0.9, 1 - warden.windup / 0.55);
+            if (warden.windup <= 0 && bossDist < 4.2) {
+              if (parryTimer > 0) {
+                parries++;
+                flashMsg('>> WARDEN CLEAVE PARRIED! <<');
+                damageMob(warden, 32, playerPos, true);
+              } else {
+                damagePlayer(warden.dmg, warden.group.position);
+              }
+            }
+          } else {
+            warden.weaponArm.rotation.x = THREE.MathUtils.lerp(warden.weaponArm.rotation.x, 0, 0.2);
+            if (bossDist > 3.6 && bossDist < 15) {
+              const dx = (playerPos.x - warden.group.position.x) / bossDist;
+              const dz = (playerPos.z - warden.group.position.z) / bossDist;
+              warden.group.position.x += dx * warden.speed * dt;
+              warden.group.position.z += dz * warden.speed * dt;
+            } else if (bossDist <= 3.6) {
+              warden.windup = 0.55;
+            }
+          }
+
+          warden.fireTimer -= dt;
+          if (warden.fireTimer <= 0) {
+            spawnOrb(warden.group.position, playerPos, 0xff5511, warden, enraged ? 10.2 : 8.5, 18);
+            warden.fireTimer = enraged ? 1.55 : 2.25;
+          }
+          warden.ringTimer -= dt;
+          if (warden.ringTimer <= 0) {
+            spawnGroundRing(playerPos.x, playerPos.z);
+            warden.ringTimer = enraged ? 3.5 : 4.4;
+          }
+        }
       }
     }
   }
 
-  // Pooled Ground Rings
+  // Update Pooled Ground Fire Rings
   for (let i = 0; i < ringPool.length; i++) {
     const r = ringPool[i];
     if (!r.active) continue;
     r.timer -= dt;
     r.mesh.material.opacity = 0.4 + (1 - r.timer / r.maxTimer) * 0.6;
     if (r.timer <= 0) {
-      spawnSparks(r.mesh.position, 0xff8822, 16);
-      if (playerPos.distanceTo(r.mesh.position) < 2.3 && dashTimer <= 0) {
-        playerHP--;
-        shake = 0.55;
-        if (playerHP <= 0) respawnPlayer();
-        refreshStatus();
-      }
+      // Curated Projectile/Blast Impact: Fire Ring + Sparks
+      spawnExpandingRing(r.mesh.position, 0xff7722, 3.6, 0.35);
+      spawnParticles(r.mesh.position, 0xff9933, 16, { spread: 9, upRand: 5 });
+      if (playerPos.distanceTo(r.mesh.position) < 2.35) damagePlayer(20, r.mesh.position);
       r.active = false;
       r.mesh.visible = false;
     }
   }
 
-  // Pooled Orbs + Static 2-Light Pool
+  // Update Pooled Orbs & Static Light Pool
   let lightIdx = 0;
   for (let i = 0; i < orbPool.length; i++) {
     const o = orbPool[i];
@@ -1354,56 +1968,38 @@ function animate() {
 
     o.mesh.position.addScaledVector(o.vel, dt);
     const distPlayer = Math.hypot(o.mesh.position.x - playerPos.x, o.mesh.position.z - playerPos.z);
-    const parryRadius = isMounted ? 3.2 : 2.5;
+    const parryRadius = isMounted ? 3.3 : 2.6;
 
     if (!o.reflected && parryTimer > 0 && distPlayer < parryRadius) {
       o.reflected = true;
       o.colorHex = 0x55ffee;
       o.mesh.material.color.setHex(0x55ffee);
       parries++;
-      hitstop = 0.05;
+      hitstop = 0.055;
       shake = 0.45;
-      spawnSparks(o.mesh.position, 0x55ffee, 14);
+      spawnParticles(o.mesh.position, 0x55ffee, 14, { spread: 9, upRand: 4, bounce: true });
       const tp = o.owner.group.position;
-      o.vel.set(tp.x - o.mesh.position.x, 0, tp.z - o.mesh.position.z).normalize().multiplyScalar(18);
+      o.vel.set(tp.x - o.mesh.position.x, 0, tp.z - o.mesh.position.z).normalize().multiplyScalar(18.5);
       flashMsg('>> BOUNCED BACK! <<');
       refreshStatus();
-    } else if (!o.reflected && distPlayer < 0.95 && dashTimer <= 0) {
-      playerHP--;
-      shake = 0.5;
-      spawnSparks(o.mesh.position, 0xff4422, 10);
+    } else if (!o.reflected && distPlayer < 0.98) {
+      // Curated Projectile Impact: Shatter Bolt shards + Fire Ring
+      spawnParticles(o.mesh.position, o.colorHex, 10, { spread: 8, upRand: 4, bounce: true });
+      spawnExpandingRing(o.mesh.position, o.colorHex, 2.0, 0.28);
+      damagePlayer(o.dmg, o.mesh.position);
       o.active = false;
       o.mesh.visible = false;
-      if (playerHP <= 0) respawnPlayer();
-      refreshStatus();
       continue;
     } else if (o.reflected && o.owner.hp > 0) {
       const distOwner = Math.hypot(
         o.mesh.position.x - o.owner.group.position.x,
         o.mesh.position.z - o.owner.group.position.z
       );
-      if (distOwner < 1.85) {
-        o.owner.hp--;
-        hitstop = 0.055;
-        shake = 0.6;
-        spawnSparks(o.mesh.position, 0x55ffee, 18);
+      if (distOwner < 1.95) {
+        spawnExpandingRing(o.mesh.position, 0x55ffee, 2.8, 0.32);
+        damageMob(o.owner, 45, playerPos, true);
         o.active = false;
         o.mesh.visible = false;
-
-        if (o.owner.hp <= 0) {
-          o.owner.group.visible = false;
-          spawnSparks(o.owner.group.position, 0xffaa33, 28);
-          if (o.owner === warden) {
-            scene.background.setHex(0x2e1c11);
-            scene.fog.color.setHex(0x2e1c11);
-            moonLight.color.setHex(0xffd28a);
-            setStoryStage(4);
-            ui.showDialogue(`THE WARDEN FALLS! DAWN RETURNS TO ASHENBROOK AND THE VALLEY. (${Math.floor(runTime)}s · ${parries} PARRIES)`, 8.5);
-          } else {
-            flashMsg('SENTINEL SHATTERED!');
-          }
-        }
-        refreshStatus();
         continue;
       }
     } else if (o.mesh.position.distanceTo(playerPos) > 52) {
@@ -1421,28 +2017,72 @@ function animate() {
   }
   for (let i = lightIdx; i < orbLightPool.length; i++) orbLightPool[i].intensity = 0;
 
-  // 1-Draw-Call Instanced Sparks
-  for (let i = 0; i < MAX_SPARKS; i++) {
-    const s = sparkData[i];
-    if (s.active) {
-      s.life -= dt;
-      if (s.life <= 0) {
-        s.active = false;
+  // --- UPDATE ALL POOLED VFX (Particles, Souls, Rings, Heal Pillar, Afterimages) ---
+  for (let i = 0; i < MAX_PARTS; i++) {
+    const p = partData[i];
+    if (p.active) {
+      p.life -= dt;
+      if (p.life <= 0) {
+        p.active = false;
         dummy.scale.setScalar(0);
       } else {
-        s.vel.y -= 15 * dt;
-        s.pos.addScaledVector(s.vel, dt);
-        dummy.position.copy(s.pos);
-        dummy.scale.setScalar(s.life / s.maxLife);
+        p.vel.y -= p.gravity * dt;
+        p.pos.addScaledVector(p.vel, dt);
+        if (p.bounce && p.pos.y < 0.14) {
+          p.pos.y = 0.14;
+          p.vel.y = Math.abs(p.vel.y) * 0.45;
+          p.vel.x *= 0.72;
+          p.vel.z *= 0.72;
+        }
+        p.rot.x += dt * 7;
+        p.rot.y += dt * 5;
+        dummy.position.copy(p.pos);
+        dummy.rotation.set(p.rot.x, p.rot.y, p.rot.z);
+        dummy.scale.setScalar((p.life / p.maxLife) * p.scale);
       }
     } else {
       dummy.scale.setScalar(0);
     }
-    dummy.rotation.set(0, 0, 0);
     dummy.updateMatrix();
-    sparkMesh.setMatrixAt(i, dummy.matrix);
+    partMesh.setMatrixAt(i, dummy.matrix);
   }
-  sparkMesh.instanceMatrix.needsUpdate = true;
+  partMesh.instanceMatrix.needsUpdate = true;
+
+  soulPool.forEach((s) => {
+    if (!s.active) return;
+    s.life -= dt;
+    if (s.life <= 0) { s.active = false; s.g.visible = false; return; }
+    const ratio = s.life / s.maxLife;
+    s.g.position.y += dt * 2.4;
+    s.g.position.x = s.baseX + Math.sin(t * 5.0 + s.phase) * 0.45;
+    s.core.material.opacity = ratio * 0.85;
+    s.tail.material.opacity = ratio * 0.5;
+  });
+
+  vfxRingPool.forEach((r) => {
+    if (!r.active) return;
+    r.life -= dt;
+    if (r.life <= 0) { r.active = false; r.m.visible = false; return; }
+    const prog = 1 - r.life / r.maxLife;
+    r.m.scale.setScalar(0.35 + prog * r.maxScale);
+    r.m.material.opacity = (1 - prog) * 0.85;
+  });
+
+  if (healPillarTimer > 0) {
+    healPillarTimer -= dt;
+    const ratio = Math.max(0, healPillarTimer / 0.45);
+    healPillar.position.set(playerPos.x, playerPos.y + 6.5, playerPos.z);
+    healPillar.scale.set(ratio, 1, ratio);
+    healPillar.material.opacity = ratio * 0.48;
+    if (healPillarTimer <= 0) healPillar.visible = false;
+  }
+
+  afterimagePool.forEach((a) => {
+    if (!a.active) return;
+    a.life -= dt;
+    if (a.life <= 0) { a.active = false; a.g.visible = false; return; }
+    a.mat.opacity = (a.life / a.maxLife) * 0.5;
+  });
 
   // Smooth Camera & Shadow Follow
   shake = Math.max(0, shake - dt * 2.5);
@@ -1458,7 +2098,10 @@ function animate() {
   moonLight.position.set(playerPos.x + 18, 34, playerPos.z + 14);
   moonLight.target.position.set(playerPos.x, 0, playerPos.z);
 
-  // Throttled 10 Hz Minimap, Area Transition Banner & Status Updates (Zero FPS impact)
+  // Update floating numbers smoothly every frame
+  ui.updateFloatTexts(dt, camera);
+
+  // Throttled 10 Hz Minimap, Area Transition & Status Updates
   uiTimer += dt;
   if (uiTimer >= 0.1) {
     uiTimer = 0;
@@ -1469,7 +2112,7 @@ function animate() {
       playerYaw: getActiveYaw(),
       horsePos: horse.root.position,
       isMounted,
-      skeletons,
+      mobs,
       warden,
       objectivePos: gameMode === 'story' && storyStage < 4 ? storyObjectivePos : null,
     });
